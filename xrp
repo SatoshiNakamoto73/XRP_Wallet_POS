@@ -24,7 +24,7 @@ import getpass
 import argparse
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ── deps ──────────────────────────────────────────────────────────────────────
 try:
@@ -449,11 +449,11 @@ def cmd_history(args):
         if meta.get("TransactionResult") != "tesSUCCESS":
             continue
 
-        amt = tx.get("Amount", "0")
+        amt = tx.get("Amount") or tx.get("DeliverMax", "0")
         if isinstance(amt, dict):
             continue
 
-        amount_xrp = float(drops_to_xrp(amt))
+        amount_xrp = float(drops_to_xrp(str(amt)))
         src        = tx.get("Account", "")
         dest       = tx.get("Destination", "")
         tag        = tx.get("DestinationTag", "")
@@ -462,7 +462,7 @@ def cmd_history(args):
         direction  = "→ in" if dest == address else "out →"
         cp         = src if dest == address else dest
 
-        dt = datetime.utcfromtimestamp(ts + 946684800).strftime("%m-%d %H:%M") if ts else "—"
+        dt = datetime.fromtimestamp(ts + 946684800, tz=timezone.utc).strftime("%m-%d %H:%M") if ts else "—"
 
         table.add_row(
             dt,
