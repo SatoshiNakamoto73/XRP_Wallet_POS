@@ -231,8 +231,8 @@ def cmd_init(args):
     console.print(Panel("[bold cyan]Generating new XRP wallet[/bold cyan]", expand=False))
     console.print(
         "\n[bold yellow]⚠  Before continuing:[/bold yellow]\n"
-        "   Activating this wallet requires sending it [bold]10 XRP[/bold].\n"
-        "   That 10 XRP reserve is [bold]permanently locked[/bold] — it cannot be spent or withdrawn.\n"
+        "   Activating this wallet requires sending it [bold]1 XRP[/bold].\n"
+        "   That 1 XRP reserve is [bold]permanently locked[/bold] — it cannot be spent or withdrawn.\n"
         "   Only proceed if you intend to fund and use this wallet.\n"
     )
     confirm = input("Continue? [y/N] ").strip().lower()
@@ -265,7 +265,7 @@ def cmd_init(args):
     console.print(f"\n[green]✓ Wallet created[/green]")
     console.print(f"  Address: [bold cyan]{wallet.classic_address}[/bold cyan]")
     console.print(f"  Stored:  {WALLET_FILE}\n")
-    console.print("[dim]Fund with at least 10 XRP to activate (XRPL reserve requirement).[/dim]")
+    console.print("[dim]Fund with at least 1 XRP to activate (XRPL reserve requirement).[/dim]")
 
 
 def cmd_address(args):
@@ -281,7 +281,7 @@ def cmd_balance(args):
         resp      = client.request(AccountInfo(account=address, ledger_index="validated"))
         drops     = int(resp.result["account_data"]["Balance"])
         xrp_bal   = float(drops_to_xrp(str(drops)))
-        reserve   = 10.0
+        reserve   = 1.0
         available = xrp_bal - reserve
         price     = get_xrp_price()
         usd_total = usd(xrp_bal, price)
@@ -302,7 +302,7 @@ def cmd_balance(args):
     except Exception as e:
         if "actNotFound" in str(e):
             console.print(f"[yellow]Account not activated yet.[/yellow]")
-            console.print(f"[dim]Send at least 10 XRP to: {address}[/dim]")
+            console.print(f"[dim]Send at least 1 XRP to: {address}[/dim]")
         else:
             console.print(f"[red]Error: {e}[/red]")
 
@@ -672,6 +672,30 @@ POS_HTML = """<!DOCTYPE html>
   .label-input::placeholder { color: #333; }
   .label-input:focus { border-color: #3a4a6e; }
 
+  .mode-toggle {
+    display: flex;
+    background: #111122;
+    border: 1px solid #2a2a3e;
+    border-radius: 10px;
+    padding: 4px;
+    gap: 4px;
+  }
+  .mode-btn {
+    flex: 1;
+    padding: 8px;
+    border: none;
+    border-radius: 7px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    background: transparent;
+    color: #555;
+    letter-spacing: 0.04em;
+  }
+  .mode-btn.active-xrp { background: #1a3a6e; color: #7eb8f7; }
+  .mode-btn.active-usd { background: #0d3d1a; color: #22c55e; }
+
   .amount-display {
     background: #111122;
     border: 1px solid #2a2a3e;
@@ -865,9 +889,14 @@ POS_HTML = """<!DOCTYPE html>
   <div class="charge-panel">
     <input class="label-input" id="label-input" type="text" placeholder="Item or note (optional)" maxlength="64" autocomplete="off">
 
+    <div class="mode-toggle">
+      <button class="mode-btn active-xrp" id="mode-xrp" onclick="setMode('xrp')">XRP</button>
+      <button class="mode-btn" id="mode-usd" onclick="setMode('usd')">USD $</button>
+    </div>
+
     <div class="amount-display">
-      <div class="amount-label">Amount (XRP)</div>
-      <div class="amount-value empty" id="amount-display">0<span class="amount-suffix">XRP</span></div>
+      <div class="amount-label" id="amount-label">Amount (XRP)</div>
+      <div class="amount-value empty" id="amount-display">0<span class="amount-suffix" id="amount-suffix">XRP</span></div>
       <div class="amount-usd" id="amount-usd"></div>
     </div>
 
@@ -938,6 +967,17 @@ let currentOrder = null;
 let es = null;
 let sales = [];
 let xrpPrice = null;
+let mode = 'xrp'; // 'xrp' or 'usd'
+
+// ── mode toggle ──
+function setMode(m) {
+  mode = m;
+  document.getElementById('mode-xrp').className = 'mode-btn' + (m === 'xrp' ? ' active-xrp' : '');
+  document.getElementById('mode-usd').className = 'mode-btn' + (m === 'usd' ? ' active-usd' : '');
+  document.getElementById('amount-label').textContent = m === 'usd' ? 'Amount (USD)' : 'Amount (XRP)';
+  amountStr = '';
+  updateAmountDisplay();
+}
 
 // ── price ──
 async function fetchPrice() {
@@ -948,15 +988,23 @@ async function fetchPrice() {
       xrpPrice = d.usd;
       document.getElementById('price-display').textContent = '1 XRP = $' + xrpPrice.toFixed(4);
       updateAmountDisplay();
+      // enable USD mode button only when price is available
+      document.getElementById('mode-usd').disabled = false;
     }
   } catch {}
 }
+document.getElementById('mode-usd').disabled = true;
 fetchPrice();
 setInterval(fetchPrice, 60000);
 
 function toUSD(xrp) {
   if (!xrpPrice || !xrp) return '';
   return '$' + (xrp * xrpPrice).toFixed(2);
+}
+
+function toXRP(usd) {
+  if (!xrpPrice || !usd) return null;
+  return Math.ceil((usd / xrpPrice) * 1000000) / 1000000; // round up to nearest drop
 }
 
 // ── keypad ──
@@ -969,39 +1017,68 @@ document.getElementById('keypad').addEventListener('click', e => {
   } else if (v === '.') {
     if (!amountStr.includes('.')) amountStr += (amountStr === '' ? '0.' : '.');
   } else {
+    // USD mode: max 2 decimal places
+    if (mode === 'usd' && amountStr.includes('.')) {
+      const decimals = amountStr.split('.')[1];
+      if (decimals && decimals.length >= 2) { updateAmountDisplay(); return; }
+    }
     if (amountStr.length < 10) amountStr += v;
   }
   updateAmountDisplay();
 });
 
 function updateAmountDisplay() {
-  const el    = document.getElementById('amount-display');
-  const usdEl = document.getElementById('amount-usd');
-  const btn   = document.getElementById('charge-btn');
-  const val   = parseFloat(amountStr);
+  const el      = document.getElementById('amount-display');
+  const usdEl   = document.getElementById('amount-usd');
+  const suffixEl = document.getElementById('amount-suffix');
+  const btn     = document.getElementById('charge-btn');
+  const val     = parseFloat(amountStr);
+
   if (!amountStr || val <= 0) {
-    el.innerHTML = '0<span class="amount-suffix">XRP</span>';
+    el.innerHTML = '0<span class="amount-suffix" id="amount-suffix">' + (mode === 'usd' ? 'USD' : 'XRP') + '</span>';
     el.classList.add('empty');
     usdEl.textContent = '';
     btn.disabled = true;
   } else {
-    el.innerHTML = amountStr + '<span class="amount-suffix">XRP</span>';
+    const suffix = mode === 'usd' ? 'USD' : 'XRP';
+    el.innerHTML = amountStr + '<span class="amount-suffix" id="amount-suffix">' + suffix + '</span>';
     el.classList.remove('empty');
-    usdEl.textContent = toUSD(val) ? '≈ ' + toUSD(val) : '';
+
+    if (mode === 'usd') {
+      const xrpVal = toXRP(val);
+      usdEl.textContent = xrpVal ? '≈ ' + xrpVal.toFixed(6) + ' XRP' : '';
+      usdEl.style.color = '#7eb8f7';
+    } else {
+      const usdVal = toUSD(val);
+      usdEl.textContent = usdVal ? '≈ ' + usdVal : '';
+      usdEl.style.color = '#22c55e';
+    }
     btn.disabled = false;
   }
 }
 
 // ── charge ──
 document.getElementById('charge-btn').addEventListener('click', async () => {
-  const amount = parseFloat(amountStr);
-  if (!amount || amount <= 0) return;
+  const inputVal = parseFloat(amountStr);
+  if (!inputVal || inputVal <= 0) return;
   const label = document.getElementById('label-input').value.trim();
+
+  // convert to XRP if in USD mode
+  let xrpAmount, usdAmount;
+  if (mode === 'usd') {
+    usdAmount = inputVal;
+    xrpAmount = toXRP(inputVal);
+    if (!xrpAmount) { alert('Price not available — cannot convert USD to XRP'); return; }
+    xrpAmount = Math.round(xrpAmount * 1000000) / 1000000;
+  } else {
+    xrpAmount = inputVal;
+    usdAmount = xrpPrice ? inputVal * xrpPrice : null;
+  }
 
   const res = await fetch('/order', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ amount, label })
+    body: JSON.stringify({ amount: xrpAmount, label })
   });
   const order = await res.json();
   currentOrder = order;
@@ -1018,10 +1095,9 @@ document.getElementById('charge-btn').addEventListener('click', async () => {
     correctLevel: QRCode.CorrectLevel.M
   });
 
-  const usdVal = toUSD(amount);
-  document.getElementById('si-amount').textContent = amount + ' XRP';
-  if (usdVal) {
-    document.getElementById('si-usd').textContent = usdVal;
+  document.getElementById('si-amount').textContent = xrpAmount + ' XRP';
+  if (usdAmount) {
+    document.getElementById('si-usd').textContent = '$' + usdAmount.toFixed(2);
     document.getElementById('si-usd-row').style.display = 'flex';
   }
   if (label) {
