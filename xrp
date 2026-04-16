@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""
+xrp — sovereign XRP terminal wallet
+Part of AIOS: AI Operating System primitives for the Linux user.
+
+Usage:
+  xrp init                          Generate new wallet
+  xrp balance                       Show balance
+  xrp receive [--amount N] [--label TEXT]   Show receive QR
+  xrp send <address> <amount> [--tag N] [--memo TEXT]
+  xrp watch [--amount N] [--tag N] [--on-payment CMD]
+  xrp history [--limit N]
+  xrp address                       Print your address
+  xrp export                        Show seed phrase (careful)
+  xrp node <url>                    Set custom XRPL node
+"""
+
+import sys
+import os
+import json
+import time
+import sqlite3
+import hashlib
+import getpass
+import argparse
+import subprocess
+import threading
+from pathlib import Path
+from datetime import datetime
+
+# ── deps ──────────────────────────────────────────────────────────────────────
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import print as rprint
+    import qrcode
+    import xrpl
+    from xrpl.wallet import Wallet
+    from xrpl.clients import JsonRpcClient, WebsocketClient
+    from xrpl.models.requests import AccountInfo, AccountTx, Subscribe
+    from xrpl.models.transactions import Payment
+    from xrpl.transaction import submit_and_wait
+    from xrpl.utils import xrp_to_drops, drops_to_xrp
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    import base64
+except ImportError as e:
+    print(f"Missing dependency: {e}")
+    print("Run: pip install xrpl-py rich qrcode cryptography --break-system-packages")
+    sys.exit(1)
+
+# ── config ────────────────────────────────────────────────────────────────────
+CONFIG_DIR  = Path.home() / ".config" / "xrp"
+WALLET_FILE = CONFIG_DIR / "wallet.enc"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DB_FILE     = CONFIG_DIR / "history.db"
+
+DEFAULT_NODE     = "https://xrplcluster.com"
+DEFAULT_WS_NODE  = "wss://xrplcluster.com"
+
+console = Console()
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def ensure_config_dir():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(0o700)
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {"node": DEFAULT_NODE, "ws_node": DEFAULT_WS_NODE}
+
+def save_config(cfg: dict):
+    ensure_config_dir()
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+def get_node() -> str:
+    return load_config().get("node", DEFAULT_NODE)
+
+def get_ws_node() -> str:
+    return load_config().get("ws_node", DEFAULT_WS_NODE)
+
+# ── encryption ────────────────────────────────────────────────────────────────
+
+def derive_key(password: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=600_000,
+    )
+    return kdf.derive(password.encode())
+
+def encrypt_seed(seed: str, password: str) -> bytes:
+    salt  = os.urandom(16)
+    nonce = os.urandom(12)
+    key   = derive_key(password, salt)
+    ct    = AESGCM(key).encrypt(nonce, seed.encode(), None)
+    return salt + nonce + ct
+
+def decrypt_seed(data: bytes, password: str) -> str:
+    salt, nonce, ct = data[:16], data[16:28], data[28:]
+    key = derive_key(password, salt)
+    try:
+        return AESGCM(key).decrypt(nonce, ct, None).decode()
+    except Exception:
+        console.print("[red]Wrong password.[/red]")
+        sys.exit(1)
+
+def load_wallet(password: str = None) -> Wallet:
+    if not WALLET_FILE.exists():
+        console.print("[red]No wallet found. Run:[/red] xrp init")
+        sys.exit(1)
+    if password is None:
+        password = getpass.getpass("Wallet password: ")
+    seed = decrypt_seed(WALLET_FILE.read_bytes(), password)
+    return Wallet.from_seed(seed)
+
+def load_address() -> str:
+    """Load address without decrypting — for receive/watch (no password needed)."""
+    cfg = load_config()
+    if "address" not in cfg:
+        console.print("[red]No wallet found. Run:[/red] xrp init")
+        sys.exit(1)
+    return cfg["address"]
+
+# ── database ──────────────────────────────────────────────────────────────────
+
+def init_db():
+    ensure_config_dir()
+    con = sqlite3.connect(DB_FILE)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS txs (
+            hash TEXT PRIMARY KEY,
+            direction TEXT,
+            amount_xrp REAL,
+            counterparty TEXT,
+            tag INTEGER,
+            memo TEXT,
+            timestamp INTEGER,
+            ledger INTEGER
+        )
+    """)
+    con.commit()
+    return con
+
+def log_tx(hash, direction, amount_xrp, counterparty, tag, memo, timestamp, ledger):
+    con = init_db()
+    con.execute(
+        "INSERT OR IGNORE INTO txs VALUES (?,?,?,?,?,?,?,?)",
+        (hash, direction, amount_xrp, counterparty, tag, memo, timestamp, ledger)
+    )
+    con.commit()
+    con.close()
+
+# ── QR ───────────────────────────────────────────────────────────────────────
+
+def print_qr(data: str):
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(data)
+    qr.make(fit=True)
+    qr.print_ascii(invert=True)
+
+def make_xrpl_uri(address: str, amount: float = None, tag: int = None, label: str = None) -> str:
+    uri = f"xrpl:{address}"
+    params = []
+    if amount:
+        drops = int(amount * 1_000_000)
+        params.append(f"amount={drops}")
+    if tag is not None:
+        params.append(f"dt={tag}")
+    if label:
+        params.append(f"label={label}")
+    if params:
+        uri += "?" + "&".join(params)
+    return uri
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def cmd_init(args):
+    ensure_config_dir()
+
+    if WALLET_FILE.exists():
+        confirm = input("Wallet already exists. Overwrite? [y/N] ").strip().lower()
+        if confirm != "y":
+            console.print("Aborted.")
+            return
+
+    console.print(Panel("[bold cyan]Generating new XRP wallet[/bold cyan]", expand=False))
+
+    wallet = Wallet.create()
+
+    console.print("\n[bold yellow]⚠  SEED PHRASE — write this down and store it offline:[/bold yellow]")
+    console.print(f"\n  [bold white]{wallet.seed}[/bold white]\n")
+    console.print("[dim]This is shown ONCE. It cannot be recovered from this app.[/dim]\n")
+
+    input("Press ENTER when you have written down your seed phrase...")
+
+    pw1 = getpass.getpass("Set wallet password: ")
+    pw2 = getpass.getpass("Confirm password: ")
+    if pw1 != pw2:
+        console.print("[red]Passwords do not match.[/red]")
+        sys.exit(1)
+
+    encrypted = encrypt_seed(wallet.seed, pw1)
+    WALLET_FILE.write_bytes(encrypted)
+    WALLET_FILE.chmod(0o600)
+
+    cfg = load_config()
+    cfg["address"] = wallet.classic_address
+    save_config(cfg)
+
+    console.print(f"\n[green]✓ Wallet created[/green]")
+    console.print(f"  Address: [bold cyan]{wallet.classic_address}[/bold cyan]")
+    console.print(f"  Stored:  {WALLET_FILE}\n")
+    console.print("[dim]Fund with at least 10 XRP to activate (XRPL reserve requirement).[/dim]")
+
+
+def cmd_address(args):
+    address = load_address()
+    console.print(f"[bold cyan]{address}[/bold cyan]")
+
+
+def cmd_balance(args):
+    address = load_address()
+    client  = JsonRpcClient(get_node())
+
+    try:
+        resp   = client.request(AccountInfo(account=address, ledger_index="validated"))
+        drops  = int(resp.result["account_data"]["Balance"])
+        xrp    = drops_to_xrp(str(drops))
+        reserve = 10.0  # base reserve
+        available = float(xrp) - reserve
+
+        console.print(Panel(
+            f"[bold cyan]{xrp} XRP[/bold cyan]\n"
+            f"[dim]~{available:.6f} XRP spendable  ({reserve} XRP reserve)[/dim]\n"
+            f"[dim]{address}[/dim]",
+            title="Balance",
+            expand=False
+        ))
+    except Exception as e:
+        if "actNotFound" in str(e):
+            console.print(f"[yellow]Account not activated yet.[/yellow]")
+            console.print(f"[dim]Send at least 10 XRP to: {address}[/dim]")
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+
+
+def cmd_receive(args):
+    address = load_address()
+    amount  = args.amount
+    tag     = args.tag
+    label   = args.label
+
+    uri = make_xrpl_uri(address, amount, tag, label)
+
+    info_lines = [f"[bold cyan]{address}[/bold cyan]"]
+    if amount:
+        info_lines.append(f"Amount: [yellow]{amount} XRP[/yellow]")
+    if tag is not None:
+        info_lines.append(f"Tag:    [yellow]{tag}[/yellow]")
+    if label:
+        info_lines.append(f"Label:  [dim]{label}[/dim]")
+
+    console.print(Panel("\n".join(info_lines), title="Receive XRP", expand=False))
+    print_qr(uri)
+    console.print(f"\n[dim]URI: {uri}[/dim]\n")
+    console.print("[dim]Scan with any XRP wallet or use: xrp send[/dim]")
+
+
+def cmd_send(args):
+    dest    = args.address
+    amount  = float(args.amount)
+    tag     = args.tag
+    memo_str = args.memo
+
+    console.print(Panel(
+        f"To:     [bold cyan]{dest}[/bold cyan]\n"
+        f"Amount: [bold yellow]{amount} XRP[/bold yellow]"
+        + (f"\nTag:    {tag}" if tag else "")
+        + (f"\nMemo:   {memo_str}" if memo_str else ""),
+        title="Confirm Send",
+        expand=False
+    ))
+
+    confirm = input("Send? [y/N] ").strip().lower()
+    if confirm != "y":
+        console.print("Cancelled.")
+        return
+
+    wallet = load_wallet()
+    client = JsonRpcClient(get_node())
+
+    tx_args = dict(
+        account=wallet.classic_address,
+        destination=dest,
+        amount=xrp_to_drops(amount),
+    )
+    if tag is not None:
+        tx_args["destination_tag"] = int(tag)
+    if memo_str:
+        from xrpl.models.transactions.transaction import Memo, MemoWrapper
+        hex_memo = memo_str.encode().hex().upper()
+        tx_args["memos"] = [MemoWrapper(memo=Memo(memo_data=hex_memo))]
+
+    with console.status("[cyan]Signing and submitting...[/cyan]"):
+        try:
+            tx     = Payment(**tx_args)
+            result = submit_and_wait(tx, client, wallet)
+            meta   = result.result.get("meta", {})
+            status = meta.get("TransactionResult", "unknown")
+
+            if status == "tesSUCCESS":
+                h = result.result.get("hash", "")
+                console.print(f"\n[green]✓ Sent![/green]  {amount} XRP → {dest}")
+                console.print(f"[dim]Hash: {h}[/dim]")
+                log_tx(h, "out", amount, dest, tag, memo_str,
+                       int(time.time()), result.result.get("ledger_index", 0))
+            else:
+                console.print(f"[red]Transaction failed: {status}[/red]")
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+
+
+def cmd_watch(args):
+    address       = load_address()
+    required_amt  = args.amount
+    required_tag  = args.tag
+    on_payment    = args.on_payment
+    once          = args.once
+
+    console.print(Panel(
+        f"Watching: [bold cyan]{address}[/bold cyan]\n"
+        + (f"Required amount: [yellow]{required_amt} XRP[/yellow]\n" if required_amt else "")
+        + (f"Required tag:    [yellow]{required_tag}[/yellow]\n" if required_tag is not None else "")
+        + (f"On payment:      [green]{on_payment}[/green]" if on_payment else "[dim]no action — logging only[/dim]"),
+        title="Watch Mode",
+        expand=False
+    ))
+
+    def handle_payment(tx: dict):
+        meta        = tx.get("meta", {})
+        tx_data     = tx.get("transaction", tx)
+        tx_type     = tx_data.get("TransactionType", "")
+
+        if tx_type != "Payment":
+            return
+
+        dest = tx_data.get("Destination", "")
+        if dest != address:
+            return
+
+        amt = tx_data.get("Amount", "0")
+        if isinstance(amt, dict):
+            return  # IOU, not XRP
+
+        amount_xrp = float(drops_to_xrp(amt))
+        tag        = tx_data.get("DestinationTag")
+        src        = tx_data.get("Account", "unknown")
+        tx_hash    = tx_data.get("hash", "")
+        status     = meta.get("TransactionResult", "")
+
+        if status != "tesSUCCESS":
+            return
+
+        if required_amt and amount_xrp < required_amt:
+            console.print(f"[dim]Received {amount_xrp} XRP (below threshold {required_amt}), ignoring[/dim]")
+            return
+
+        if required_tag is not None and tag != required_tag:
+            console.print(f"[dim]Wrong tag {tag}, ignoring[/dim]")
+            return
+
+        ts = int(time.time())
+        log_tx(tx_hash, "in", amount_xrp, src, tag, None, ts, 0)
+
+        console.print(
+            f"\n[bold green]✓ PAYMENT RECEIVED[/bold green]  "
+            f"[yellow]{amount_xrp} XRP[/yellow] from [cyan]{src}[/cyan]"
+            + (f"  tag={tag}" if tag else "")
+            + f"  [{datetime.now().strftime('%H:%M:%S')}]"
+        )
+
+        if on_payment:
+            env = os.environ.copy()
+            env["XRP_AMOUNT"]      = str(amount_xrp)
+            env["XRP_SENDER"]      = src
+            env["XRP_TAG"]         = str(tag) if tag else ""
+            env["XRP_HASH"]        = tx_hash
+            env["XRP_DESTINATION"] = address
+            try:
+                subprocess.Popen(on_payment, shell=True, env=env)
+                console.print(f"[dim]→ exec: {on_payment}[/dim]")
+            except Exception as e:
+                console.print(f"[red]Failed to exec on-payment command: {e}[/red]")
+
+        if once:
+            console.print("[dim]--once flag set, exiting.[/dim]")
+            os._exit(0)
+
+    console.print(f"[dim]Connecting to {get_ws_node()}...[/dim]")
+
+    try:
+        with WebsocketClient(get_ws_node()) as client:
+            client.send(Subscribe(accounts=[address]))
+            console.print("[green]Connected. Waiting for payments...[/green]  [dim](Ctrl+C to stop)[/dim]\n")
+            for message in client:
+                if message.get("type") == "transaction":
+                    handle_payment(message)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Watch stopped.[/dim]")
+    except Exception as e:
+        console.print(f"[red]WebSocket error: {e}[/red]")
+        console.print("[dim]Retrying in 5s...[/dim]")
+        time.sleep(5)
+        cmd_watch(args)
+
+
+def cmd_history(args):
+    address = load_address()
+    limit   = args.limit or 20
+    client  = JsonRpcClient(get_node())
+
+    try:
+        resp = client.request(AccountTx(account=address, limit=limit, ledger_index_min=-1, ledger_index_max=-1))
+        txs  = resp.result.get("transactions", [])
+    except Exception as e:
+        console.print(f"[red]Error fetching history: {e}[/red]")
+        return
+
+    if not txs:
+        console.print("[dim]No transactions found.[/dim]")
+        return
+
+    table = Table(title=f"Recent Transactions — {address[:16]}...")
+    table.add_column("Time", style="dim", width=12)
+    table.add_column("Dir", width=4)
+    table.add_column("Amount", justify="right", style="yellow")
+    table.add_column("Counterparty", style="cyan")
+    table.add_column("Tag", width=8)
+    table.add_column("Hash", style="dim", width=12)
+
+    for entry in txs:
+        tx   = entry.get("tx", entry.get("transaction", {}))
+        meta = entry.get("meta", {})
+
+        if tx.get("TransactionType") != "Payment":
+            continue
+        if meta.get("TransactionResult") != "tesSUCCESS":
+            continue
+
+        amt = tx.get("Amount", "0")
+        if isinstance(amt, dict):
+            continue
+
+        amount_xrp = float(drops_to_xrp(amt))
+        src        = tx.get("Account", "")
+        dest       = tx.get("Destination", "")
+        tag        = tx.get("DestinationTag", "")
+        h          = tx.get("hash", "")
+        ts         = tx.get("date", 0)
+        direction  = "→ in" if dest == address else "out →"
+        cp         = src if dest == address else dest
+
+        dt = datetime.utcfromtimestamp(ts + 946684800).strftime("%m-%d %H:%M") if ts else "—"
+
+        table.add_row(
+            dt,
+            "[green]↓[/green]" if dest == address else "[red]↑[/red]",
+            f"{amount_xrp:.4f} XRP",
+            cp[:20] + "..." if len(cp) > 20 else cp,
+            str(tag),
+            h[:12] + "..."
+        )
+
+    console.print(table)
+
+
+def cmd_export(args):
+    console.print("[bold red]⚠  This will display your seed phrase in plaintext.[/bold red]")
+    confirm = input("Type YES to continue: ").strip()
+    if confirm != "YES":
+        console.print("Aborted.")
+        return
+    wallet = load_wallet()
+    console.print(f"\n[bold yellow]Seed: {wallet.seed}[/bold yellow]\n")
+    console.print("[dim]Store this offline. Anyone with this seed controls your funds.[/dim]")
+
+
+def cmd_node(args):
+    cfg = load_config()
+    url = args.url
+    ws  = url.replace("https://", "wss://").replace("http://", "ws://")
+    cfg["node"]    = url
+    cfg["ws_node"] = ws
+    save_config(cfg)
+    console.print(f"[green]Node set:[/green] {url}")
+    console.print(f"[dim]WebSocket: {ws}[/dim]")
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="xrp",
+        description="Sovereign XRP terminal wallet — part of AIOS",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # init
+    sub.add_parser("init", help="Generate a new wallet")
+
+    # address
+    sub.add_parser("address", help="Print your XRP address")
+
+    # balance
+    sub.add_parser("balance", help="Show balance")
+
+    # receive
+    p_recv = sub.add_parser("receive", help="Show receive QR code")
+    p_recv.add_argument("--amount", type=float, help="Request specific XRP amount")
+    p_recv.add_argument("--tag",    type=int,   help="Destination tag")
+    p_recv.add_argument("--label",  type=str,   help="Payment label")
+
+    # send
+    p_send = sub.add_parser("send", help="Send XRP")
+    p_send.add_argument("address", help="Destination address")
+    p_send.add_argument("amount",  help="Amount in XRP")
+    p_send.add_argument("--tag",   type=int, help="Destination tag")
+    p_send.add_argument("--memo",  type=str, help="Memo text")
+
+    # watch
+    p_watch = sub.add_parser("watch", help="Watch for incoming payments")
+    p_watch.add_argument("--amount",     type=float, help="Minimum XRP amount to trigger")
+    p_watch.add_argument("--tag",        type=int,   help="Only trigger on this destination tag")
+    p_watch.add_argument("--on-payment", type=str,   dest="on_payment", help="Shell command to run on payment")
+    p_watch.add_argument("--once",       action="store_true", help="Exit after first matching payment")
+
+    # history
+    p_hist = sub.add_parser("history", help="Show transaction history")
+    p_hist.add_argument("--limit", type=int, default=20, help="Number of transactions")
+
+    # export
+    sub.add_parser("export", help="Show seed phrase (dangerous)")
+
+    # node
+    p_node = sub.add_parser("node", help="Set custom XRPL node URL")
+    p_node.add_argument("url", help="Node URL (e.g. https://xrplcluster.com)")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        return
+
+    dispatch = {
+        "init":    cmd_init,
+        "address": cmd_address,
+        "balance": cmd_balance,
+        "receive": cmd_receive,
+        "send":    cmd_send,
+        "watch":   cmd_watch,
+        "history": cmd_history,
+        "export":  cmd_export,
+        "node":    cmd_node,
+    }
+
+    dispatch[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
