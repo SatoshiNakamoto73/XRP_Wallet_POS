@@ -589,6 +589,84 @@ def cmd_export_csv(args):
         console.print(f"[dim]USD values at current rate: 1 XRP = ${price:.4f}[/dim]")
 
 
+def cmd_pos_orders(args):
+    orders_file = CONFIG_DIR / "pos_orders.json"
+    if not orders_file.exists():
+        console.print("[dim]No orders file found. Start the POS to create orders.[/dim]")
+        return
+
+    try:
+        raw = {int(k): v for k, v in json.loads(orders_file.read_text()).items()}
+    except Exception as e:
+        console.print(f"[red]Error reading orders: {e}[/red]")
+        return
+
+    if not raw:
+        console.print("[dim]No orders found.[/dim]")
+        return
+
+    # filter by status if requested
+    status_filter = args.status
+    price = get_xrp_price()
+
+    table = Table(title=f"POS Orders — {orders_file}")
+    table.add_column("Tag",     style="dim",   width=10)
+    table.add_column("Time",    style="dim",   width=14)
+    table.add_column("Status",                 width=10)
+    table.add_column("Amount",  justify="right", style="yellow")
+    table.add_column("USD",     justify="right", style="green")
+    table.add_column("Label",   style="cyan")
+    table.add_column("Sender",  style="dim")
+
+    counts = {"paid": 0, "pending": 0, "cancelled": 0}
+    total_xrp = 0.0
+
+    # sort by created time descending
+    sorted_orders = sorted(raw.items(), key=lambda x: x[1].get("created", 0), reverse=True)
+
+    for tag, o in sorted_orders:
+        status = o.get("status", "unknown")
+        if status_filter and status != status_filter:
+            continue
+
+        counts[status] = counts.get(status, 0) + 1
+        amount = o.get("amount", 0)
+        label  = o.get("label", "")
+        sender = o.get("sender") or ""
+        ts     = o.get("paid_at") or o.get("created") or 0
+        dt     = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m-%d %H:%M") if ts else "—"
+        usd_val = f"${amount * price:.2f}" if price else "—"
+
+        if status == "paid":
+            total_xrp += amount
+            status_str = "[bold green]paid[/bold green]"
+        elif status == "pending":
+            status_str = "[yellow]pending[/yellow]"
+        else:
+            status_str = "[dim]cancelled[/dim]"
+
+        table.add_row(
+            str(tag),
+            dt,
+            status_str,
+            f"{amount:.6f} XRP",
+            usd_val if status == "paid" else "[dim]—[/dim]",
+            label[:28] + "..." if len(label) > 28 else label,
+            sender[:18] + "..." if len(sender) > 18 else sender,
+        )
+
+    console.print(table)
+
+    # summary footer
+    summary = f"[dim]Paid: [green]{counts.get('paid',0)}[/green]  Pending: [yellow]{counts.get('pending',0)}[/yellow]  Cancelled: {counts.get('cancelled',0)}"
+    if total_xrp > 0:
+        summary += f"  |  Total paid: [bold yellow]{total_xrp:.6f} XRP[/bold yellow]"
+        if price:
+            summary += f"  [bold green](${total_xrp * price:.2f})[/bold green]"
+    summary += "[/dim]"
+    console.print(summary)
+
+
 def cmd_export(args):
     console.print("[bold red]⚠  This will display your seed phrase in plaintext.[/bold red]")
     confirm = input("Type YES to continue: ").strip()
@@ -997,6 +1075,25 @@ document.getElementById('mode-usd').disabled = true;
 fetchPrice();
 setInterval(fetchPrice, 60000);
 
+// ── load today's sales on startup ──
+async function loadTodaySales() {
+  try {
+    const r = await fetch('/history');
+    const d = await r.json();
+    if (d.sales && d.sales.length) {
+      sales = d.sales.map(s => ({
+        tag:    s.tag,
+        amount: s.amount,
+        label:  s.label || '',
+        sender: s.sender || '',
+        time:   new Date(s.time * 1000),
+      }));
+      renderHistory();
+    }
+  } catch {}
+}
+loadTodaySales();
+
 function toUSD(xrp) {
   if (!xrpPrice || !xrp) return '';
   return '$' + (xrp * xrpPrice).toFixed(2);
@@ -1269,6 +1366,7 @@ def cmd_pos(args):
                     return
                 orders[tag]["status"] = "paid"
                 orders[tag]["sender"] = sender
+                orders[tag]["paid_at"] = int(time.time())
                 save_orders()
 
         while True:
@@ -1302,6 +1400,24 @@ def cmd_pos(args):
             elif p.path == '/price':
                 price = get_xrp_price()
                 self.json({"usd": price})
+
+            elif p.path == '/history':
+                today_start = datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+                paid = []
+                for tag, o in orders.items():
+                    if o.get("status") != "paid": continue
+                    ts = o.get("paid_at") or o.get("created") or 0
+                    # include if we have no timestamp (legacy orders) or if it's today
+                    if ts == 0 or ts >= today_start:
+                        paid.append({
+                            "tag":    tag,
+                            "amount": o.get("amount", 0),
+                            "label":  o.get("label", ""),
+                            "sender": o.get("sender", ""),
+                            "time":   ts,
+                        })
+                paid.sort(key=lambda x: x["time"], reverse=True)
+                self.json({"sales": paid})
 
             elif p.path == '/status':
                 tag = int(parse_qs(p.query).get("tag",["0"])[0])
@@ -1340,6 +1456,7 @@ def cmd_pos(args):
                             if tag_match or amount_match:
                                 orders[tag]["status"] = "paid"
                                 orders[tag]["sender"] = tx_sender
+                                orders[tag]["paid_at"] = int(time.time())
                                 save_orders()
                                 log_tx(tx_hash, "in", tx_amount, tx_sender, tx_tag, None, int(time.time()), 0)
                                 self.json({"status":"paid","amount":tx_amount,"sender":tx_sender,"label":order.get("label","")})
@@ -1362,7 +1479,7 @@ def cmd_pos(args):
                 tag    = random.randint(10000, 9999999)
                 while tag in orders:
                     tag = random.randint(10000, 9999999)
-                orders[tag] = {"amount": amount, "label": label, "status": "pending", "sender": None}
+                orders[tag] = {"amount": amount, "label": label, "status": "pending", "sender": None, "created": int(time.time())}
                 save_orders()
                 uri = make_xrpl_uri(address, amount, tag)
                 self.json({"tag": tag, "amount": amount, "label": label, "address": address, "uri": uri})
@@ -1462,6 +1579,10 @@ def main():
     p_hist = sub.add_parser("history", help="Show transaction history")
     p_hist.add_argument("--limit", type=int, default=20, help="Number of transactions")
 
+    # pos-orders
+    p_po = sub.add_parser("pos-orders", help="View POS order history")
+    p_po.add_argument("--status", type=str, choices=["paid","pending","cancelled"], help="Filter by status")
+
     # export-csv
     p_csv = sub.add_parser("export-csv", help="Export transaction history to CSV")
     p_csv.add_argument("--out", type=str, help="Output filename")
@@ -1493,6 +1614,7 @@ def main():
         "send":    cmd_send,
         "watch":   cmd_watch,
         "history":    cmd_history,
+        "pos-orders": cmd_pos_orders,
         "export-csv": cmd_export_csv,
         "export":     cmd_export,
         "node":    cmd_node,
