@@ -1,7 +1,5 @@
 # xrp — Sovereign XRP Terminal Wallet
 
-Part of **AIOS**: bare-metal, local-first operating system primitives for the sovereign Linux user.
-
 No phone app. No exchange account. No cloud. Your keys live encrypted on your machine. The tool talks directly to the XRP Ledger over WebSocket.
 
 ---
@@ -109,16 +107,6 @@ WantedBy=multi-user.target
 ├── config.json     # node URL, public address
 └── history.db      # SQLite local tx log
 ```
-
----
-
-## Part of AIOS
-
-| Tool | Role |
-|---|---|
-| `ai` | Local LLM assistant (DeepSeek R1 via Ollama) |
-| `scrape` | Playwright-based recursive web scraper with AI |
-| `xrp` | Sovereign XRP payment layer |
 
 ---
 
