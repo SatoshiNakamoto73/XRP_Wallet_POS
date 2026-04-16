@@ -9,10 +9,11 @@ Usage:
   xrp send <address> <amount> [--tag N] [--memo TEXT]
   xrp watch [--amount N] [--tag N] [--on-payment CMD]
   xrp history [--limit N]
+  xrp export-csv [--out FILE]       Export transaction history to CSV
   xrp address                       Print your address
   xrp export                        Show seed phrase (careful)
   xrp node <url>                    Set custom XRPL node
-  xrp pos [--port N]                Launch browser-based point of sale
+  xrp pos [--port N] [--name TEXT] [--lan]  Launch browser-based point of sale
 """
 
 import sys
@@ -42,6 +43,7 @@ try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.hazmat.primitives import hashes
+    from argon2.low_level import hash_secret_raw, Type as Argon2Type
 except ImportError as e:
     print(f"Missing dependency: {e}")
     print("Run: pip install xrpl-py rich qrcode cryptography --break-system-packages")
@@ -79,27 +81,68 @@ def get_node() -> str:
 def get_ws_node() -> str:
     return load_config().get("ws_node", DEFAULT_WS_NODE)
 
+# ── price ─────────────────────────────────────────────────────────────────────
+
+_price_cache = {"usd": None, "ts": 0}
+
+def get_xrp_price() -> float | None:
+    """Fetch live XRP/USD price. Cached for 60 seconds."""
+    import urllib.request
+    now = time.time()
+    if _price_cache["usd"] and now - _price_cache["ts"] < 60:
+        return _price_cache["usd"]
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd"
+        req = urllib.request.Request(url, headers={"User-Agent": "xrp-wallet/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+            price = float(data["ripple"]["usd"])
+            _price_cache["usd"] = price
+            _price_cache["ts"]  = now
+            return price
+    except:
+        return _price_cache["usd"]  # return stale if fetch fails
+
+def usd(xrp_amount: float, price: float | None) -> str:
+    if price is None:
+        return ""
+    return f"${xrp_amount * price:,.2f}"
+
 # ── encryption ────────────────────────────────────────────────────────────────
 
-def derive_key(password: str, salt: bytes) -> bytes:
+def derive_key_pbkdf2(password: str, salt: bytes) -> bytes:
+    """Legacy key derivation — used only to migrate existing wallets."""
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=600_000,
+        length=32, salt=salt, iterations=600_000,
     )
     return kdf.derive(password.encode())
+
+def derive_key(password: str, salt: bytes) -> bytes:
+    """Argon2id key derivation — memory-hard, GPU-resistant."""
+    return hash_secret_raw(
+        secret=password.encode(),
+        salt=salt,
+        time_cost=3,
+        memory_cost=65536,  # 64 MB
+        parallelism=2,
+        hash_len=32,
+        type=Argon2Type.ID,
+    )
 
 def encrypt_seed(seed: str, password: str) -> bytes:
     salt  = os.urandom(16)
     nonce = os.urandom(12)
     key   = derive_key(password, salt)
     ct    = AESGCM(key).encrypt(nonce, seed.encode(), None)
-    return salt + nonce + ct
+    # version byte 0x02 = argon2id (0x01 was PBKDF2)
+    return b'\x02' + salt + nonce + ct
 
 def decrypt_seed(data: bytes, password: str) -> str:
-    salt, nonce, ct = data[:16], data[16:28], data[28:]
-    key = derive_key(password, salt)
+    version = data[0] if data[0] in (1, 2) else 1
+    payload = data[1:] if data[0] in (1, 2) else data
+    salt, nonce, ct = payload[:16], payload[16:28], payload[28:]
+    key = derive_key(password, salt) if version == 2 else derive_key_pbkdf2(password, salt)
     try:
         return AESGCM(key).decrypt(nonce, ct, None).decode()
     except Exception:
@@ -186,6 +229,16 @@ def cmd_init(args):
             return
 
     console.print(Panel("[bold cyan]Generating new XRP wallet[/bold cyan]", expand=False))
+    console.print(
+        "\n[bold yellow]⚠  Before continuing:[/bold yellow]\n"
+        "   Activating this wallet requires sending it [bold]10 XRP[/bold].\n"
+        "   That 10 XRP reserve is [bold]permanently locked[/bold] — it cannot be spent or withdrawn.\n"
+        "   Only proceed if you intend to fund and use this wallet.\n"
+    )
+    confirm = input("Continue? [y/N] ").strip().lower()
+    if confirm != "y":
+        console.print("Aborted.")
+        return
 
     wallet = Wallet.create()
 
@@ -225,15 +278,23 @@ def cmd_balance(args):
     client  = JsonRpcClient(get_node())
 
     try:
-        resp   = client.request(AccountInfo(account=address, ledger_index="validated"))
-        drops  = int(resp.result["account_data"]["Balance"])
-        xrp    = drops_to_xrp(str(drops))
-        reserve = 10.0  # base reserve
-        available = float(xrp) - reserve
+        resp      = client.request(AccountInfo(account=address, ledger_index="validated"))
+        drops     = int(resp.result["account_data"]["Balance"])
+        xrp_bal   = float(drops_to_xrp(str(drops)))
+        reserve   = 10.0
+        available = xrp_bal - reserve
+        price     = get_xrp_price()
+        usd_total = usd(xrp_bal, price)
+        usd_avail = usd(available, price)
+        price_str = f"  [dim](1 XRP = ${price:,.4f})[/dim]" if price else ""
 
         console.print(Panel(
-            f"[bold cyan]{xrp} XRP[/bold cyan]\n"
-            f"[dim]~{available:.6f} XRP spendable  ({reserve} XRP reserve)[/dim]\n"
+            f"[bold cyan]{xrp_bal:.6f} XRP[/bold cyan]"
+            + (f"  [bold green]{usd_total}[/bold green]" if usd_total else "")
+            + price_str + "\n"
+            f"[dim]~{available:.6f} XRP spendable"
+            + (f"  {usd_avail}" if usd_avail else "")
+            + f"  ({reserve} XRP reserve)[/dim]\n"
             f"[dim]{address}[/dim]",
             title="Balance",
             expand=False
@@ -420,6 +481,7 @@ def cmd_history(args):
     address = load_address()
     limit   = args.limit or 20
     client  = JsonRpcClient(get_node())
+    price   = get_xrp_price()
 
     try:
         resp = client.request(AccountTx(account=address, limit=limit, ledger_index_min=-1, ledger_index_max=-1))
@@ -433,12 +495,13 @@ def cmd_history(args):
         return
 
     table = Table(title=f"Recent Transactions — {address[:16]}...")
-    table.add_column("Time", style="dim", width=12)
-    table.add_column("Dir", width=4)
-    table.add_column("Amount", justify="right", style="yellow")
+    table.add_column("Time",         style="dim", width=12)
+    table.add_column("Dir",          width=4)
+    table.add_column("Amount",       justify="right", style="yellow")
+    table.add_column("USD",          justify="right", style="green")
     table.add_column("Counterparty", style="cyan")
-    table.add_column("Tag", width=8)
-    table.add_column("Hash", style="dim", width=12)
+    table.add_column("Tag",          width=8)
+    table.add_column("Hash",         style="dim", width=14)
 
     for entry in txs:
         tx   = entry.get("tx_json", entry.get("tx", entry.get("transaction", {})))
@@ -457,23 +520,71 @@ def cmd_history(args):
         src        = tx.get("Account", "")
         dest       = tx.get("Destination", "")
         tag        = tx.get("DestinationTag", "")
-        h          = tx.get("hash", "")
+        h          = entry.get("hash", tx.get("hash", ""))
         ts         = tx.get("date", 0)
-        direction  = "→ in" if dest == address else "out →"
         cp         = src if dest == address else dest
-
-        dt = datetime.fromtimestamp(ts + 946684800, tz=timezone.utc).strftime("%m-%d %H:%M") if ts else "—"
+        dt         = datetime.fromtimestamp(ts + 946684800, tz=timezone.utc).strftime("%m-%d %H:%M") if ts else "—"
+        usd_val    = usd(amount_xrp, price) if price else "—"
 
         table.add_row(
             dt,
             "[green]↓[/green]" if dest == address else "[red]↑[/red]",
             f"{amount_xrp:.4f} XRP",
-            cp[:20] + "..." if len(cp) > 20 else cp,
+            usd_val,
+            cp[:18] + "..." if len(cp) > 18 else cp,
             str(tag),
-            h[:12] + "..."
+            h[:14] + "..." if h else "—"
         )
 
+    price_note = f"  [dim](1 XRP ≈ ${price:,.4f})[/dim]" if price else ""
     console.print(table)
+    if price_note:
+        console.print(price_note)
+
+
+def cmd_export_csv(args):
+    import csv
+    address = load_address()
+    client  = JsonRpcClient(get_node())
+    outfile = args.out or f"xrp_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    price   = get_xrp_price()
+
+    console.print(f"[dim]Fetching transactions...[/dim]")
+    try:
+        resp = client.request(AccountTx(account=address, limit=400, ledger_index_min=-1, ledger_index_max=-1))
+        txs  = resp.result.get("transactions", [])
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        return
+
+    rows = []
+    for entry in txs:
+        tx   = entry.get("tx_json", entry.get("tx", entry.get("transaction", {})))
+        meta = entry.get("meta", {})
+        if tx.get("TransactionType") != "Payment": continue
+        if meta.get("TransactionResult") != "tesSUCCESS": continue
+        amt = tx.get("Amount") or tx.get("DeliverMax", "0")
+        if isinstance(amt, dict): continue
+        amount_xrp = float(drops_to_xrp(str(amt)))
+        src   = tx.get("Account", "")
+        dest  = tx.get("Destination", "")
+        tag   = tx.get("DestinationTag", "")
+        h     = entry.get("hash", tx.get("hash", ""))
+        ts    = tx.get("date", 0)
+        dt    = datetime.fromtimestamp(ts + 946684800, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if ts else ""
+        direction = "in" if dest == address else "out"
+        cp    = src if dest == address else dest
+        usd_val = f"{amount_xrp * price:.2f}" if price else ""
+        rows.append([dt, direction, f"{amount_xrp:.6f}", usd_val, cp, str(tag), h])
+
+    with open(outfile, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["datetime_utc", "direction", "amount_xrp", "amount_usd", "counterparty", "tag", "hash"])
+        w.writerows(rows)
+
+    console.print(f"[green]✓ Exported {len(rows)} transactions to[/green] [bold]{outfile}[/bold]")
+    if price:
+        console.print(f"[dim]USD values at current rate: 1 XRP = ${price:.4f}[/dim]")
 
 
 def cmd_export(args):
@@ -521,48 +632,67 @@ POS_HTML = """<!DOCTYPE html>
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 16px 24px;
+    padding: 14px 24px;
     border-bottom: 1px solid #1e1e2e;
     background: #0d0d18;
+    flex-wrap: wrap;
+    gap: 8px;
   }
   header h1 { font-size: 1.1rem; font-weight: 600; color: #7eb8f7; letter-spacing: 0.05em; }
-  #balance-display { font-size: 0.85rem; color: #888; }
-  #balance-display span { color: #7eb8f7; font-weight: 600; }
+  .header-right { display: flex; align-items: center; gap: 20px; font-size: 0.85rem; color: #888; }
+  .header-stat span { color: #7eb8f7; font-weight: 600; }
+  .header-stat .usd-val { color: #22c55e; }
+  #price-display { color: #555; font-size: 0.78rem; }
 
   .main { display: flex; flex: 1; gap: 0; }
 
   /* LEFT — charge panel */
   .charge-panel {
     flex: 1;
-    padding: 32px 28px;
+    padding: 28px 24px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 14px;
     border-right: 1px solid #1e1e2e;
     max-width: 420px;
   }
+  .label-input {
+    background: #111122;
+    border: 1px solid #2a2a3e;
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 0.95rem;
+    color: #e0e0e0;
+    outline: none;
+    width: 100%;
+    transition: border-color 0.15s;
+  }
+  .label-input::placeholder { color: #333; }
+  .label-input:focus { border-color: #3a4a6e; }
+
   .amount-display {
     background: #111122;
     border: 1px solid #2a2a3e;
     border-radius: 12px;
-    padding: 20px 24px;
+    padding: 16px 20px;
     text-align: right;
   }
-  .amount-label { font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; }
-  .amount-value { font-size: 3rem; font-weight: 700; color: #fff; letter-spacing: -0.02em; min-height: 64px; word-break: break-all; }
+  .amount-label { font-size: 0.72rem; color: #666; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 6px; }
+  .amount-value { font-size: 2.6rem; font-weight: 700; color: #fff; letter-spacing: -0.02em; min-height: 56px; word-break: break-all; line-height: 1.1; }
   .amount-value.empty { color: #333; }
-  .amount-suffix { font-size: 1.2rem; color: #7eb8f7; margin-left: 6px; }
+  .amount-suffix { font-size: 1.1rem; color: #7eb8f7; margin-left: 4px; }
+  .amount-usd { font-size: 0.9rem; color: #22c55e; margin-top: 4px; min-height: 1.2em; }
 
   .keypad {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
-    gap: 10px;
+    gap: 8px;
   }
   .key {
     background: #141428;
     border: 1px solid #252540;
     border-radius: 10px;
-    padding: 18px 8px;
+    padding: 16px 8px;
     font-size: 1.4rem;
     font-weight: 500;
     color: #ddd;
@@ -580,8 +710,8 @@ POS_HTML = """<!DOCTYPE html>
     background: #1a6ef5;
     border: none;
     border-radius: 12px;
-    padding: 18px;
-    font-size: 1.15rem;
+    padding: 16px;
+    font-size: 1.1rem;
     font-weight: 700;
     color: #fff;
     cursor: pointer;
@@ -595,12 +725,12 @@ POS_HTML = """<!DOCTYPE html>
   /* RIGHT — QR / status panel */
   .qr-panel {
     flex: 1;
-    padding: 32px 28px;
+    padding: 28px 24px;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 24px;
+    gap: 20px;
   }
 
   .state-idle { text-align: center; color: #444; }
@@ -611,18 +741,19 @@ POS_HTML = """<!DOCTYPE html>
   .qr-box {
     background: #fff;
     border-radius: 16px;
-    padding: 20px;
+    padding: 18px;
     display: inline-block;
     box-shadow: 0 0 40px rgba(126,184,247,0.12);
-    margin-bottom: 20px;
+    margin-bottom: 16px;
   }
-  .sale-info { background: #111122; border: 1px solid #2a2a3e; border-radius: 10px; padding: 16px 20px; width: 100%; }
-  .sale-info-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 0.9rem; }
+  .sale-info { background: #111122; border: 1px solid #2a2a3e; border-radius: 10px; padding: 14px 18px; width: 100%; }
+  .sale-info-row { display: flex; justify-content: space-between; margin-bottom: 7px; font-size: 0.88rem; }
   .sale-info-row:last-child { margin-bottom: 0; }
   .sale-info-row .label { color: #666; }
   .sale-info-row .value { color: #e0e0e0; font-weight: 500; }
-  .sale-info-row .value.amount { color: #7eb8f7; font-size: 1.1rem; font-weight: 700; }
-  .waiting-hint { color: #555; font-size: 0.85rem; margin-top: 16px; }
+  .sale-info-row .value.amount { color: #7eb8f7; font-size: 1.05rem; font-weight: 700; }
+  .sale-info-row .value.usd { color: #22c55e; }
+  .waiting-hint { color: #555; font-size: 0.85rem; margin-top: 14px; }
   .cancel-btn {
     background: transparent;
     border: 1px solid #3a1a1a;
@@ -632,7 +763,7 @@ POS_HTML = """<!DOCTYPE html>
     font-weight: 500;
     color: #f87575;
     cursor: pointer;
-    margin-top: 12px;
+    margin-top: 10px;
     transition: background 0.15s, border-color 0.15s;
   }
   .cancel-btn:hover { background: #2a1010; border-color: #f87575; }
@@ -645,17 +776,19 @@ POS_HTML = """<!DOCTYPE html>
   }
   @keyframes popIn { 0%{transform:scale(0.7);opacity:0} 100%{transform:scale(1);opacity:1} }
   .paid-check {
-    width: 96px; height: 96px;
+    width: 88px; height: 88px;
     background: #0d3d1a;
     border: 3px solid #22c55e;
     border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
-    margin: 0 auto 20px;
-    font-size: 2.5rem;
+    margin: 0 auto 16px;
+    font-size: 2.2rem;
   }
-  .paid-title { font-size: 2rem; font-weight: 800; color: #22c55e; margin-bottom: 8px; }
-  .paid-amount { font-size: 1.3rem; color: #7eb8f7; margin-bottom: 6px; }
-  .paid-from { font-size: 0.8rem; color: #555; margin-bottom: 24px; word-break: break-all; }
+  .paid-title { font-size: 2rem; font-weight: 800; color: #22c55e; margin-bottom: 6px; }
+  .paid-amount { font-size: 1.3rem; color: #7eb8f7; margin-bottom: 4px; }
+  .paid-usd { font-size: 1rem; color: #22c55e; margin-bottom: 4px; }
+  .paid-label { font-size: 0.9rem; color: #888; margin-bottom: 4px; }
+  .paid-from { font-size: 0.78rem; color: #555; margin-bottom: 20px; word-break: break-all; }
   .new-sale-btn {
     background: #0d3d1a;
     border: 2px solid #22c55e;
@@ -669,26 +802,38 @@ POS_HTML = """<!DOCTYPE html>
   }
   .new-sale-btn:hover { background: #133d1e; }
 
-  /* RIGHT BOTTOM — history */
+  /* history */
   .history-panel {
     border-top: 1px solid #1e1e2e;
-    padding: 16px 28px;
-    max-height: 220px;
+    padding: 14px 24px;
+    max-height: 200px;
     overflow-y: auto;
   }
-  .history-panel h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: #555; margin-bottom: 12px; }
-  .history-item {
+  .history-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 8px 0;
+    margin-bottom: 10px;
+  }
+  .history-header h3 { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.1em; color: #555; }
+  .daily-total { font-size: 0.82rem; color: #888; }
+  .daily-total .total-xrp { color: #7eb8f7; font-weight: 600; }
+  .daily-total .total-usd { color: #22c55e; font-weight: 600; }
+  .history-item {
+    display: grid;
+    grid-template-columns: 1fr auto auto auto;
+    gap: 8px;
+    align-items: center;
+    padding: 7px 0;
     border-bottom: 1px solid #131320;
-    font-size: 0.85rem;
+    font-size: 0.83rem;
   }
   .history-item:last-child { border-bottom: none; }
-  .history-item .hi-amount { color: #22c55e; font-weight: 600; }
-  .history-item .hi-time { color: #555; font-size: 0.78rem; }
-  .history-item .hi-tag { color: #444; font-size: 0.78rem; }
+  .hi-label { color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hi-label.no-label { color: #444; font-style: italic; }
+  .hi-amount { color: #22c55e; font-weight: 600; white-space: nowrap; }
+  .hi-usd { color: #22c55e; opacity: 0.7; font-size: 0.78rem; white-space: nowrap; }
+  .hi-time { color: #555; font-size: 0.75rem; white-space: nowrap; }
   .no-history { color: #333; font-size: 0.85rem; }
 
   #status-dot {
@@ -703,15 +848,25 @@ POS_HTML = """<!DOCTYPE html>
 <body>
 <header>
   <h1>⬡ XRP Point of Sale</h1>
-  <div id="balance-display"><span id="status-dot"></span>Balance: <span id="bal">—</span> XRP</div>
+  <div class="header-right">
+    <div class="header-stat">
+      <span id="status-dot"></span>
+      <span id="bal">—</span> XRP
+      <span class="usd-val" id="bal-usd"></span>
+    </div>
+    <div id="price-display">1 XRP = $—</div>
+  </div>
 </header>
 
 <div class="main">
   <!-- LEFT: keypad -->
   <div class="charge-panel">
+    <input class="label-input" id="label-input" type="text" placeholder="Item or note (optional)" maxlength="64" autocomplete="off">
+
     <div class="amount-display">
-      <div class="amount-label">Amount</div>
+      <div class="amount-label">Amount (XRP)</div>
       <div class="amount-value empty" id="amount-display">0<span class="amount-suffix">XRP</span></div>
+      <div class="amount-usd" id="amount-usd"></div>
     </div>
 
     <div class="keypad" id="keypad">
@@ -746,8 +901,10 @@ POS_HTML = """<!DOCTYPE html>
         <div class="qr-box" id="qr-box"></div>
         <div class="sale-info">
           <div class="sale-info-row"><span class="label">Amount</span><span class="value amount" id="si-amount">—</span></div>
+          <div class="sale-info-row" id="si-usd-row" style="display:none"><span class="label">USD</span><span class="value usd" id="si-usd">—</span></div>
+          <div class="sale-info-row" id="si-label-row" style="display:none"><span class="label">Item</span><span class="value" id="si-label">—</span></div>
           <div class="sale-info-row"><span class="label">Order #</span><span class="value" id="si-tag">—</span></div>
-          <div class="sale-info-row"><span class="label">Address</span><span class="value" id="si-addr" style="font-size:0.75rem;color:#555">—</span></div>
+          <div class="sale-info-row"><span class="label">Address</span><span class="value" id="si-addr" style="font-size:0.72rem;color:#555">—</span></div>
         </div>
         <div class="waiting-hint pulse">Waiting for payment...</div>
         <button class="cancel-btn" id="cancel-btn">Cancel</button>
@@ -756,24 +913,49 @@ POS_HTML = """<!DOCTYPE html>
         <div class="paid-check">✓</div>
         <div class="paid-title">PAID</div>
         <div class="paid-amount" id="paid-amount">—</div>
+        <div class="paid-usd" id="paid-usd"></div>
+        <div class="paid-label" id="paid-label"></div>
         <div class="paid-from" id="paid-from">—</div>
         <button class="new-sale-btn" id="new-sale-btn">New Sale</button>
       </div>
     </div>
 
     <div class="history-panel">
-      <h3>Today's Sales</h3>
+      <div class="history-header">
+        <h3>Today's Sales</h3>
+        <div class="daily-total" id="daily-total"></div>
+      </div>
       <div id="history-list"><span class="no-history">No sales yet</span></div>
     </div>
   </div>
 </div>
 
 <script>
-const API = '';
 let amountStr = '';
 let currentOrder = null;
 let es = null;
 let sales = [];
+let xrpPrice = null;
+
+// ── price ──
+async function fetchPrice() {
+  try {
+    const r = await fetch('/price');
+    const d = await r.json();
+    if (d.usd) {
+      xrpPrice = d.usd;
+      document.getElementById('price-display').textContent = '1 XRP = $' + xrpPrice.toFixed(4);
+      updateAmountDisplay();
+    }
+  } catch {}
+}
+fetchPrice();
+setInterval(fetchPrice, 60000);
+
+function toUSD(xrp) {
+  if (!xrpPrice || !xrp) return '';
+  return '$' + (xrp * xrpPrice).toFixed(2);
+}
 
 // ── keypad ──
 document.getElementById('keypad').addEventListener('click', e => {
@@ -791,16 +973,19 @@ document.getElementById('keypad').addEventListener('click', e => {
 });
 
 function updateAmountDisplay() {
-  const el = document.getElementById('amount-display');
-  const btn = document.getElementById('charge-btn');
-  const val = parseFloat(amountStr);
+  const el    = document.getElementById('amount-display');
+  const usdEl = document.getElementById('amount-usd');
+  const btn   = document.getElementById('charge-btn');
+  const val   = parseFloat(amountStr);
   if (!amountStr || val <= 0) {
     el.innerHTML = '0<span class="amount-suffix">XRP</span>';
     el.classList.add('empty');
+    usdEl.textContent = '';
     btn.disabled = true;
   } else {
     el.innerHTML = amountStr + '<span class="amount-suffix">XRP</span>';
     el.classList.remove('empty');
+    usdEl.textContent = toUSD(val) ? '≈ ' + toUSD(val) : '';
     btn.disabled = false;
   }
 }
@@ -809,39 +994,47 @@ function updateAmountDisplay() {
 document.getElementById('charge-btn').addEventListener('click', async () => {
   const amount = parseFloat(amountStr);
   if (!amount || amount <= 0) return;
+  const label = document.getElementById('label-input').value.trim();
 
   const res = await fetch('/order', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ amount })
+    body: JSON.stringify({ amount, label })
   });
   const order = await res.json();
   currentOrder = order;
 
-  // show waiting state
   document.getElementById('state-idle').style.display = 'none';
   document.getElementById('state-waiting').style.display = 'block';
   document.getElementById('state-paid').style.display = 'none';
 
-  // render QR
   document.getElementById('qr-box').innerHTML = '';
   new QRCode(document.getElementById('qr-box'), {
     text: order.uri,
-    width: 220,
-    height: 220,
-    colorDark: '#000000',
-    colorLight: '#ffffff',
+    width: 210, height: 210,
+    colorDark: '#000000', colorLight: '#ffffff',
     correctLevel: QRCode.CorrectLevel.M
   });
 
+  const usdVal = toUSD(amount);
   document.getElementById('si-amount').textContent = amount + ' XRP';
+  if (usdVal) {
+    document.getElementById('si-usd').textContent = usdVal;
+    document.getElementById('si-usd-row').style.display = 'flex';
+  }
+  if (label) {
+    document.getElementById('si-label').textContent = label;
+    document.getElementById('si-label-row').style.display = 'flex';
+  } else {
+    document.getElementById('si-label-row').style.display = 'none';
+  }
   document.getElementById('si-tag').textContent = order.tag;
   document.getElementById('si-addr').textContent = order.address;
 
   amountStr = '';
+  document.getElementById('label-input').value = '';
   updateAmountDisplay();
 
-  // poll for payment confirmation
   if (es) { clearInterval(es); es = null; }
   es = setInterval(async () => {
     try {
@@ -849,58 +1042,79 @@ document.getElementById('charge-btn').addEventListener('click', async () => {
       const d = await r.json();
       if (d.status === 'paid') {
         clearInterval(es); es = null;
-        handlePaid({ tag: order.tag, amount: d.amount, sender: d.sender });
+        handlePaid({ tag: order.tag, amount: d.amount, sender: d.sender, label: order.label });
       }
     } catch {}
   }, 1000);
 });
 
 function handlePaid(data) {
-  if (es) { es.close(); es = null; }
+  if (es) { clearInterval(es); es = null; }
   document.getElementById('state-waiting').style.display = 'none';
   document.getElementById('state-paid').style.display = 'block';
+
+  const usdVal = toUSD(data.amount);
   document.getElementById('paid-amount').textContent = data.amount + ' XRP received';
+  document.getElementById('paid-usd').textContent = usdVal ? '≈ ' + usdVal : '';
+  document.getElementById('paid-label').textContent = data.label || '';
   document.getElementById('paid-from').textContent = 'From: ' + data.sender;
 
-  sales.unshift({ amount: data.amount, tag: data.tag, time: new Date(), sender: data.sender });
+  sales.unshift({ amount: data.amount, label: data.label || '', tag: data.tag, time: new Date() });
   renderHistory();
 }
 
-document.getElementById('new-sale-btn').addEventListener('click', () => {
-  currentOrder = null;
-  document.getElementById('state-idle').style.display = 'block';
-  document.getElementById('state-waiting').style.display = 'none';
-  document.getElementById('state-paid').style.display = 'none';
-});
-
+document.getElementById('new-sale-btn').addEventListener('click', resetToIdle);
 document.getElementById('cancel-btn').addEventListener('click', async () => {
   if (currentOrder) {
     await fetch('/cancel', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ tag: currentOrder.tag })
-    });
+    }).catch(() => {});
   }
   if (es) { clearInterval(es); es = null; }
+  document.getElementById('qr-box').innerHTML = '';
+  resetToIdle();
+});
+
+function resetToIdle() {
   currentOrder = null;
   amountStr = '';
   updateAmountDisplay();
+  document.getElementById('label-input').value = '';
   document.getElementById('state-idle').style.display = 'block';
   document.getElementById('state-waiting').style.display = 'none';
   document.getElementById('state-paid').style.display = 'none';
-  document.getElementById('qr-box').innerHTML = '';
-});
+  document.getElementById('si-usd-row').style.display = 'none';
+  document.getElementById('si-label-row').style.display = 'none';
+}
 
 function renderHistory() {
   const el = document.getElementById('history-list');
-  if (!sales.length) { el.innerHTML = '<span class="no-history">No sales yet</span>'; return; }
-  el.innerHTML = sales.slice(0,20).map(s =>
-    `<div class="history-item">
+  if (!sales.length) {
+    el.innerHTML = '<span class="no-history">No sales yet</span>';
+    document.getElementById('daily-total').innerHTML = '';
+    return;
+  }
+
+  // daily total
+  const todayStr = new Date().toDateString();
+  const todaySales = sales.filter(s => s.time.toDateString() === todayStr);
+  const totalXRP = todaySales.reduce((a, s) => a + s.amount, 0);
+  const totalUSD = toUSD(totalXRP);
+  document.getElementById('daily-total').innerHTML =
+    'Today: <span class="total-xrp">' + totalXRP.toFixed(4) + ' XRP</span>' +
+    (totalUSD ? ' <span class="total-usd">' + totalUSD + '</span>' : '');
+
+  el.innerHTML = sales.slice(0,20).map(s => {
+    const u = toUSD(s.amount);
+    return `<div class="history-item">
+      <span class="hi-label ${s.label ? '' : 'no-label'}">${s.label || 'no label'}</span>
       <span class="hi-amount">+${s.amount} XRP</span>
-      <span class="hi-tag">#${s.tag}</span>
+      ${u ? `<span class="hi-usd">${u}</span>` : '<span></span>'}
       <span class="hi-time">${s.time.toLocaleTimeString()}</span>
-    </div>`
-  ).join('');
+    </div>`;
+  }).join('');
 }
 
 // ── balance poll ──
@@ -909,6 +1123,8 @@ async function pollBalance() {
     const r = await fetch('/balance');
     const d = await r.json();
     document.getElementById('bal').textContent = d.balance ?? '—';
+    const usdBal = toUSD(d.balance);
+    document.getElementById('bal-usd').textContent = usdBal ? '≈ ' + usdBal : '';
     document.getElementById('status-dot').classList.remove('disconnected');
   } catch {
     document.getElementById('status-dot').classList.add('disconnected');
@@ -929,6 +1145,7 @@ def cmd_pos(args):
 
     address    = load_address()
     port       = args.port or 7743
+    merchant   = args.name or "XRP Point of Sale"
     orders_file = CONFIG_DIR / "pos_orders.json"
 
     def load_orders():
@@ -996,11 +1213,17 @@ def cmd_pos(args):
                 self.send_response(200)
                 self.send_header("Content-Type","text/html; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(POS_HTML.encode())
+                html = POS_HTML.replace("⬡ XRP Point of Sale", f"⬡ {merchant}")
+                self.wfile.write(html.encode())
 
             elif p.path == '/balance':
-                bal = get_balance()
-                self.json({"balance": bal})
+                bal   = get_balance()
+                price = get_xrp_price()
+                self.json({"balance": bal, "usd": round(bal * price, 2) if bal and price else None, "price": price})
+
+            elif p.path == '/price':
+                price = get_xrp_price()
+                self.json({"usd": price})
 
             elif p.path == '/status':
                 tag = int(parse_qs(p.query).get("tag",["0"])[0])
@@ -1008,7 +1231,7 @@ def cmd_pos(args):
 
                 # fast path — already confirmed by watcher
                 if order.get("status") == "paid":
-                    self.json({"status":"paid","amount":order.get("amount",0),"sender":order.get("sender","")})
+                    self.json({"status":"paid","amount":order.get("amount",0),"sender":order.get("sender",""),"label":order.get("label","")})
                     return
 
                 if order.get("status") == "cancelled":
@@ -1041,7 +1264,7 @@ def cmd_pos(args):
                                 orders[tag]["sender"] = tx_sender
                                 save_orders()
                                 log_tx(tx_hash, "in", tx_amount, tx_sender, tx_tag, None, int(time.time()), 0)
-                                self.json({"status":"paid","amount":tx_amount,"sender":tx_sender})
+                                self.json({"status":"paid","amount":tx_amount,"sender":tx_sender,"label":order.get("label","")})
                                 return
                     except Exception:
                         pass
@@ -1057,13 +1280,14 @@ def cmd_pos(args):
                 length = int(self.headers.get("Content-Length",0))
                 body   = json.loads(self.rfile.read(length))
                 amount = float(body.get("amount", 0))
+                label  = str(body.get("label", ""))[:64]
                 tag    = random.randint(10000, 9999999)
                 while tag in orders:
                     tag = random.randint(10000, 9999999)
-                orders[tag] = {"amount": amount, "status": "pending", "sender": None}
+                orders[tag] = {"amount": amount, "label": label, "status": "pending", "sender": None}
                 save_orders()
                 uri = make_xrpl_uri(address, amount, tag)
-                self.json({"tag": tag, "amount": amount, "address": address, "uri": uri})
+                self.json({"tag": tag, "amount": amount, "label": label, "address": address, "uri": uri})
 
             elif self.path == '/cancel':
                 length = int(self.headers.get("Content-Length",0))
@@ -1088,13 +1312,26 @@ def cmd_pos(args):
     t = threading.Thread(target=xrpl_watcher, daemon=True)
     t.start()
 
+    # LAN IP detection
+    import socket
+    lan_ip = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+        s.close()
+    except:
+        pass
+
     server = ThreadingHTTPServer(("0.0.0.0", port), POSHandler)
+    lan_line = f"LAN:     [bold green]http://{lan_ip}:{port}[/bold green]  [dim](tablets, phones)[/dim]\n" if lan_ip and args.lan else ""
     console.print(Panel(
         f"Address: [bold cyan]{address}[/bold cyan]\n"
-        f"URL:     [bold green]http://localhost:{port}[/bold green]\n\n"
-        f"[dim]Open the URL in any browser on this machine.\n"
+        f"URL:     [bold green]http://localhost:{port}[/bold green]\n"
+        + lan_line +
+        f"\n[dim]Open the URL in any browser on this machine.\n"
         f"Listening for payments on XRPL...[/dim]",
-        title="XRP Point of Sale",
+        title=f"XRP Point of Sale{' — ' + args.name if args.name else ''}",
         expand=False
     ))
 
@@ -1147,6 +1384,10 @@ def main():
     p_hist = sub.add_parser("history", help="Show transaction history")
     p_hist.add_argument("--limit", type=int, default=20, help="Number of transactions")
 
+    # export-csv
+    p_csv = sub.add_parser("export-csv", help="Export transaction history to CSV")
+    p_csv.add_argument("--out", type=str, help="Output filename")
+
     # export
     sub.add_parser("export", help="Show seed phrase (dangerous)")
 
@@ -1157,6 +1398,8 @@ def main():
     # pos
     p_pos = sub.add_parser("pos", help="Launch browser-based point of sale")
     p_pos.add_argument("--port", type=int, default=7743, help="HTTP port (default: 7743)")
+    p_pos.add_argument("--name", type=str, default="", help="Merchant name shown in POS header")
+    p_pos.add_argument("--lan",  action="store_true", help="Print LAN IP for tablet access")
 
     args = parser.parse_args()
 
@@ -1171,8 +1414,9 @@ def main():
         "receive": cmd_receive,
         "send":    cmd_send,
         "watch":   cmd_watch,
-        "history": cmd_history,
-        "export":  cmd_export,
+        "history":    cmd_history,
+        "export-csv": cmd_export_csv,
+        "export":     cmd_export,
         "node":    cmd_node,
         "pos":     cmd_pos,
     }
